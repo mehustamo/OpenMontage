@@ -704,6 +704,7 @@ class TestCapabilityMetadata:
             "inworld",
             "kling_official",
             "openai",
+            "openrouter",
             "piper",
         }
 
