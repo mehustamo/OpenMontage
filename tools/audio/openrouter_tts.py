@@ -62,6 +62,48 @@ def format_from_content_type(content_type: str) -> tuple[Optional[str], Optional
     return _CONTENT_TYPE_FORMATS.get((content_type or "").split(";")[0].strip().lower(), (None, None))
 
 
+def pcm_params(content_type: str, *, default_rate: int = 24000, default_channels: int = 1) -> tuple[int, int]:
+    """Read ``rate`` and ``channels`` from e.g. ``audio/pcm;rate=24000;channels=1``.
+
+    Raw PCM carries no header, so these values are the only way to interpret the
+    bytes; OpenRouter states them on the response, not in the request.
+    """
+    rate, channels = default_rate, default_channels
+    for part in (content_type or "").split(";")[1:]:
+        key, _, value = part.strip().partition("=")
+        if key == "rate":
+            try:
+                rate = int(value)
+            except ValueError:
+                pass
+        elif key == "channels":
+            try:
+                channels = int(value)
+            except ValueError:
+                pass
+    return rate, channels
+
+
+def wrap_pcm_as_wav(data: bytes, *, rate: int, channels: int) -> bytes:
+    """Wrap headerless 16-bit little-endian PCM in a WAV container.
+
+    Some hosts accept only ``mp3`` or ``pcm`` (Voxtral rejects ``wav``), and mp3
+    would be a needless first-generation lossy encode before the final mix. Wrapped
+    PCM is lossless, playable by ffmpeg/Remotion, and half the bytes of the raw
+    stream being misinterpreted downstream.
+    """
+    import io
+    import wave
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(channels)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(data)
+    return buffer.getvalue()
+
+
 class OpenRouterTTS(BaseTool):
     name = "openrouter_tts"
     version = "0.1.0"
@@ -130,8 +172,13 @@ class OpenRouterTTS(BaseTool):
             "voice_id": {"type": "string", "description": "Alias for voice"},
             "response_format": {
                 "type": "string",
-                "enum": ["mp3", "wav", "flac", "opus", "aac", "pcm"],
+                "enum": ["mp3", "pcm"],
                 "default": "mp3",
+                "description": (
+                    "Verified values on this API. 'mp3' is delivery-ready; 'pcm' is "
+                    "lossless (Voxtral rejects wav) and is returned wrapped in a WAV "
+                    "container, which is what to use before mixing or mastering."
+                ),
             },
             "speed": {"type": "number", "minimum": 0.25, "maximum": 4.0},
             "instructions": {
@@ -234,6 +281,17 @@ class OpenRouterTTS(BaseTool):
         detected_format, detected_extension = format_from_content_type(content_type)
         delivered_format = detected_format or requested_format
         extension = detected_extension or _FORMAT_EXTENSIONS.get(requested_format, "mp3")
+        wrapped = False
+        pcm_rate: Optional[int] = None
+        pcm_channels: Optional[int] = None
+        if delivered_format == "pcm":
+            # Headerless PCM is useless to ffmpeg/Remotion and easy to misread;
+            # wrap it losslessly instead of handing over a raw stream.
+            pcm_rate, pcm_channels = pcm_params(content_type)
+            audio = wrap_pcm_as_wav(audio, rate=pcm_rate, channels=pcm_channels)
+            extension = "wav"
+            delivered_format = "wav"
+            wrapped = True
         output_path = Path(inputs.get("output_path") or f"{self.name}.{extension}")
         try:
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -257,6 +315,10 @@ class OpenRouterTTS(BaseTool):
                 "delivered_format": delivered_format,
                 "content_type": content_type or None,
                 "format_mismatch": bool(detected_format and detected_format != requested_format),
+                "pcm_wrapped": wrapped,
+                "sample_rate": pcm_rate,
+                "channels": pcm_channels,
+                "lossless": wrapped or requested_format in ("wav", "flac"),
                 "text_length": len(str(payload["input"])),
                 "turn_count": len(payload["input"]) if isinstance(payload["input"], list) else 0,
                 "output": str(output_path),

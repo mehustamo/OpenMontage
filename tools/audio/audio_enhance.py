@@ -22,6 +22,34 @@ from tools.base_tool import (
 )
 
 
+# Codec implied by the output container. The tool defaulted to AAC for every
+# extension, so an ``output_path`` ending in .wav produced an AAC stream wearing a
+# WAV name: unreadable by audio_mixer, Remotion and any other consumer that trusts
+# the extension.
+_EXTENSION_CODECS = {
+    ".wav": "pcm_s16le",
+    ".wave": "pcm_s16le",
+    ".mp3": "libmp3lame",
+    ".flac": "flac",
+    ".m4a": "aac",
+    ".aac": "aac",
+    ".opus": "libopus",
+    ".ogg": "libvorbis",
+    ".wma": "wmav2",
+}
+_LOSSLESS_CODECS = ("pcm_", "flac", "alac", "wavpack")
+
+
+def codec_for_output(output_path: str | Path) -> str:
+    """Pick the audio codec from the output extension (AAC when unknown)."""
+    return _EXTENSION_CODECS.get(Path(output_path).suffix.lower(), "aac")
+
+
+def is_lossless_codec(codec: str) -> bool:
+    """Whether ``-b:a`` is meaningless for this codec."""
+    return codec.startswith(_LOSSLESS_CODECS)
+
+
 PRESETS = {
     "clean_speech": {
         "description": "Noise gate + highpass + compressor + limiter for clean dialogue",
@@ -114,8 +142,23 @@ class AudioEnhance(BaseTool):
                 "type": "string",
                 "description": "Custom FFmpeg audio filter string",
             },
-            "audio_codec": {"type": "string", "default": "aac"},
+            "audio_codec": {
+                "type": "string",
+                "description": (
+                    "Audio codec; omitted means it is derived from the output "
+                    "extension (.wav -> pcm_s16le, .mp3 -> libmp3lame, .flac -> flac, "
+                    "else aac). An explicit value wins."
+                ),
+            },
             "audio_bitrate": {"type": "string", "default": "192k"},
+            "sample_rate": {
+                "type": "integer",
+                "description": (
+                    "Output sample rate. Omitted means 48000 for PCM/FLAC outputs "
+                    "(loudnorm's own default is 192000, which bloats a lossless file "
+                    "for no benefit) and the input rate otherwise."
+                ),
+            },
         },
     }
 
@@ -135,8 +178,11 @@ class AudioEnhance(BaseTool):
         output_path = Path(
             inputs.get("output_path", str(input_path.with_stem(f"{input_path.stem}_enhanced")))
         )
-        audio_codec = inputs.get("audio_codec", "aac")
+        audio_codec = inputs.get("audio_codec") or codec_for_output(output_path)
         audio_bitrate = inputs.get("audio_bitrate", "192k")
+        sample_rate = inputs.get("sample_rate")
+        if sample_rate is None and is_lossless_codec(audio_codec):
+            sample_rate = 48000
 
         af = inputs.get("custom_af")
         if not af:
@@ -158,7 +204,11 @@ class AudioEnhance(BaseTool):
         ]
         if is_video:
             cmd.extend(["-c:v", "copy"])
-        cmd.extend(["-c:a", audio_codec, "-b:a", audio_bitrate])
+        cmd.extend(["-c:a", audio_codec])
+        if not is_lossless_codec(audio_codec):
+            cmd.extend(["-b:a", audio_bitrate])
+        if sample_rate:
+            cmd.extend(["-ar", str(sample_rate)])
         cmd.append(str(output_path))
 
         try:
@@ -175,6 +225,9 @@ class AudioEnhance(BaseTool):
                 "output": str(output_path),
                 "preset": inputs.get("preset"),
                 "filter": af,
+                "audio_codec": audio_codec,
+                "audio_bitrate": None if is_lossless_codec(audio_codec) else audio_bitrate,
+                "sample_rate": sample_rate,
             },
             artifacts=[str(output_path)],
             duration_seconds=round(elapsed, 2),
