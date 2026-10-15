@@ -383,6 +383,41 @@ class TestSpeech:
 
         assert format_from_content_type(content_type) == expected
 
+    def test_response_format_only_offers_verified_values(self):
+        # Voxtral rejects wav/flac/opus/aac with a 400; mp3 and pcm are what works.
+        assert OpenRouterTTS().input_schema["properties"]["response_format"]["enum"] == ["mp3", "pcm"]
+
+    @pytest.mark.parametrize(
+        "content_type,expected",
+        [
+            ("audio/pcm;rate=24000;channels=1", (24000, 1)),
+            ("audio/pcm; rate=16000; channels=2", (16000, 2)),
+            ("audio/pcm", (24000, 1)),
+            ("", (24000, 1)),
+            ("audio/pcm;rate=abc;channels=1", (24000, 1)),
+        ],
+    )
+    def test_pcm_params_are_read_from_the_response(self, content_type, expected):
+        from tools.audio.openrouter_tts import pcm_params
+
+        assert pcm_params(content_type) == expected
+
+    def test_pcm_is_wrapped_into_a_playable_wav(self):
+        # Raw PCM has no header: downstream tools need a container, and mp3 would
+        # be a needless first-generation lossy encode before the final mix.
+        import wave
+        from io import BytesIO
+
+        from tools.audio.openrouter_tts import wrap_pcm_as_wav
+
+        samples = b"\x00\x01" * 2400
+        wrapped = wrap_pcm_as_wav(samples, rate=24000, channels=1)
+        assert wrapped[:4] == b"RIFF" and wrapped[8:12] == b"WAVE"
+        with wave.open(BytesIO(wrapped)) as handle:
+            assert handle.getframerate() == 24000
+            assert handle.getnchannels() == 1
+            assert handle.readframes(handle.getnframes()) == samples
+
     def test_multi_speaker_turns_replace_text(self):
         _, payload = OpenRouterTTS().build_request({
             "voice": "en_paul_neutral",
