@@ -37,6 +37,28 @@ from tools.provider_pricing import PriceQuoteRequired
 _FORMATS = {"mp3": "mp3", "wav": "wav", "flac": "flac", "opus": "opus", "pcm16": "pcm"}
 
 
+def audio_duration_seconds(path: str) -> float:
+    """Measure what was actually written; 0.0 when ffprobe cannot say.
+
+    Music duration is a prompt target, so the delivered length is the only fact
+    worth reporting back to the caller.
+    """
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffprobe"):
+        return 0.0
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", path],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        return float(out.stdout.strip())
+    except (subprocess.SubprocessError, ValueError):
+        return 0.0
+
+
 class OpenRouterMusic(BaseTool):
     name = "openrouter_music"
     version = "0.1.0"
@@ -190,6 +212,11 @@ class OpenRouterMusic(BaseTool):
             return ToolResult(success=False, error=f"Could not write music output: {exc}")
 
         cost = client.usage_cost({"usage": usage}) if usage else None
+        delivered = audio_duration_seconds(str(output_path))
+        requested = inputs.get("duration_seconds")
+        shortfall = bool(
+            requested and delivered and delivered < float(requested) * 0.9
+        )
         return ToolResult(
             success=True,
             data={
@@ -197,7 +224,11 @@ class OpenRouterMusic(BaseTool):
                 "hosting_provider": "openrouter.ai",
                 "model": model,
                 "format": fmt,
-                "duration_seconds": inputs.get("duration_seconds"),
+                "duration_seconds": requested,
+                "delivered_seconds": round(delivered, 2) if delivered else None,
+                # The clip model maxes out around 30 s whatever you ask for; say so
+                # instead of letting the caller discover it when the bed runs out.
+                "duration_shortfall": shortfall,
                 "output": str(output_path),
                 "bytes": len(audio),
                 "chunks": len(chunks),

@@ -31,13 +31,27 @@ DEFAULT_MUSIC_MODEL = "google/lyria-3-clip-preview"
 
 # Verified on 2026-10-15 against the live endpoint. ``requires_voice`` means a
 # request without ``voice`` returns 400 ("An explicit voice is required").
+# ``formats`` is the accepted ``response_format`` surface: sending anything else
+# is rejected with 400, so the tool validates it before spending the call.
 SPEECH_MODELS: dict[str, dict[str, Any]] = {
+    "google/gemini-3.8-flash-tts": {
+        "name": "Gemini 3.8 Flash TTS",
+        "formats": ("pcm",),
+        "requires_voice": False,
+        # Gemini's named voices (Kore, Puck, Charon, Aoede, Leda, ...) are
+        # language-agnostic and handle Finnish; without one the host picks a default.
+        "sample_voice": "Charon",
+        "notes": (
+            "Multilingual, PCM only (mp3 is rejected). Arrives hot: measured up to "
+            "+0.6 dBTP, so normalise before mixing."
+        ),
+    },
     "mistralai/voxtral-mini-tts-2603": {
         "name": "Voxtral Mini TTS",
-        "formats": ("mp3", "wav", "pcm", "flac", "opus"),
+        "formats": ("mp3", "pcm"),
         "requires_voice": True,
         "sample_voice": "en_paul_neutral",
-        "notes": "Fast, low-cost narration. Voice ids are Voxtral speaker ids.",
+        "notes": "Fast, low-cost narration. Voice ids are Voxtral speaker ids (en_*).",
     },
     "fish-audio/s2-pro": {
         "name": "Fish Audio S2 Pro",
