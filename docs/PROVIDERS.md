@@ -81,6 +81,7 @@ AZURE_SPEECH_REGION=         # Speech resource region, e.g. eastus
 FAL_KEY=                     # FLUX, Recraft, Kling, Veo, MiniMax video
 MINIMAX_API_KEY=             # MiniMax first-party image + MiniMax H3 video generation
 ATLASCLOUD_API_KEY=          # Atlas Cloud image/video gateway
+OPENROUTER_API_KEY=          # Images + video + speech + music through one OpenRouter key
 
 # KLING OFFICIAL DIRECT API
 KLING_API_KEY=               # Official Kling video, image, TTS, avatar, lip sync
@@ -382,6 +383,62 @@ The same key can also access ElevenLabs speech and music through fal.ai. Use
 select it through `tts_selector` with `preferred_provider: "fal.ai"`.
 
 ---
+
+### OpenRouter — Images, Video, Speech and Music (One Key)
+
+OpenRouter is an aggregator with dedicated generated-media endpoints. One
+`OPENROUTER_API_KEY` unlocks all four media capabilities, and image responses
+report the exact billed cost in `usage.cost` instead of an estimate.
+
+```bash
+OPENROUTER_API_KEY=sk-or-v1-...   # https://openrouter.ai/keys
+# optional host override, default https://openrouter.ai/api/v1
+# OPENROUTER_BASE_URL=
+```
+
+| Capability | Tool | Endpoint |
+|---|---|---|
+| Image generation + editing | `openrouter_image` | `POST /api/v1/images` |
+| Video generation (async job) | `openrouter_video` | `POST /api/v1/videos`, `GET /api/v1/videos/{id}`, `/content` |
+| Speech synthesis | `openrouter_tts` | `POST /api/v1/audio/speech` |
+| Music generation (Lyria 3) | `openrouter_music` | `POST /api/v1/chat/completions`, `modalities=["text","audio"]` |
+
+Verified with live calls on 2026-10-15 (cheapest defaults):
+
+| Call | Model | Result | Cost |
+|---|---|---|---|
+| image | `black-forest-labs/flux.2-klein-4b` | 1024×1024 JPEG in 3.6 s | $0.014 (reported) |
+| video | `x-ai/grok-imagine-video-1.5-lite` | 848×480 h264+aac, 2 s clip in 29 s | $0.04 ($0.02/s at 480p) |
+| speech | `mistralai/voxtral-mini-tts-2603` | 5.5 s mp3 via `voice=en_paul_neutral` | not reported by the API |
+| music | `google/lyria-3-clip-preview` | streamed mp3 | not reported by the API |
+
+**Image routes.** 57 models at the time of writing, including
+`google/gemini-3.1-flash-image` (Nano Banana 2), `google/gemini-3-pro-image`,
+`openai/gpt-image-2`/`gpt-5-image`, `bytedance-seed/seedream-5-0-pro`,
+`black-forest-labs/flux.2-*`, `qwen/qwen-image-3-pro`, `recraft/recraft-v4*` and
+`x-ai/grok-imagine-image-2.0`. Shape is controlled with `aspect_ratio` +
+`resolution` (`512`…`4K`) or an authoritative `size`. Editing uses
+`input_references` — local files are inlined as base64 data URLs. There is no
+negative-prompt parameter on this API.
+
+**Video routes.** 30 models, including `google/veo-3.1`, `bytedance/seedance-2.0*`,
+`kwaivgi/kling-v3.0-*`, `alibaba/wan-3.0`, `minimax/hailuo-3*`,
+`openai`-adjacent routes via other hosts, and `x-ai/grok-imagine-video-*`.
+Submission returns a job id and `polling_url`; the tool checkpoints the job to
+`job_path` and resumes with `resume_job`, so a poll timeout never triggers a
+second paid submission. `duration`, `resolution` and `aspect_ratio` are validated
+against the model's advertised capabilities before submitting. `generate_audio`
+is honored only where advertised.
+
+**Speech.** No model-list endpoint exists, so the catalog is hand-maintained in
+`tools/openrouter_models.SPEECH_MODELS` (`mistralai/voxtral-mini-tts-2603` needs
+an explicit `voice`, `fish-audio/s2-pro`, `elevenlabs/eleven-v4-turbo`). Multi-speaker
+dialogue is supported through `turns`.
+
+**Catalogs.** `tools/provider_contracts/openrouter_media.json` is a snapshot of
+`/images/models` and `/videos/models`; refresh it with
+`scripts/openrouter_models_refresh.py`. Live smoke test:
+`scripts/openrouter_media_smoke.py --all` (spends credits).
 
 ### MiniMax — Official Direct Image and Video API
 
@@ -1447,6 +1504,7 @@ These tools require only FFmpeg or Python packages — no GPU, no API key.
 | **fish.audio** | `FISH_AUDIO_API_KEY` | `fish_audio_tts` | Free tier (s2.1-pro-free) + paid |
 | **fal.ai** | `FAL_KEY` | `flux_image`, `recraft_image`, `kling_video`, `veo_video`, `seedance_video`, `gemini_omni_fal`, `minimax_fal_video` | Pay-as-you-go |
 | **Atlas Cloud** | `ATLASCLOUD_API_KEY` | `atlas_image`, `atlas_video` | Pay-as-you-go |
+| **OpenRouter** | `OPENROUTER_API_KEY` | `openrouter_image`, `openrouter_video`, `openrouter_tts`, `openrouter_music` | Pay-as-you-go |
 | **Kling Official** | `KLING_API_KEY` | `kling_official_video`, `kling_official_image`, `kling_tts`, `kling_avatar`, `kling_lip_sync` | Pay-as-you-go |
 | **Volcengine Ark** | `ARK_API_KEY` | `seedance_ark` | Pay-as-you-go |
 | **MiniMax direct** | `MINIMAX_API_KEY` | `minimax_image`, `minimax_video` | Pay-as-you-go |
@@ -1470,10 +1528,10 @@ How many providers cover each capability:
 
 | Capability | Cloud Providers | Local Providers | Free Options |
 |-----------|----------------|-----------------|--------------|
-| **Image Generation** | FLUX, Kling Official, Grok, Google Imagen, GPT Image 2, Recraft | Local Diffusion | Pexels, Pixabay (stock) |
-| **Video Generation** | Grok, Kling Official, fal.ai, Seedance via Volcengine Ark, Runway, Veo, Gemini Omni, Higgsfield, MiniMax, HeyGen, Tencent Hunyuan, ComfyUI Partner Nodes | WAN, Hunyuan, CogVideo, LTX, ComfyUI WAN, ComfyUI MiniMax H3 | Pexels, Pixabay (stock) |
-| **Text-to-Speech** | Azure AI Speech, ElevenLabs, fish.audio, Google TTS, Kling Official, OpenAI | Piper | Piper, Google free tier, ElevenLabs free tier, Azure free tier, fish.audio s2.1-pro-free |
-| **Music Generation** | ElevenLabs, Suno, Google Lyria | — | ElevenLabs free tier |
+| **Image Generation** | FLUX, Kling Official, Grok, Google Imagen, GPT Image 2, Recraft, OpenRouter | Local Diffusion | Pexels, Pixabay (stock) |
+| **Video Generation** | Grok, Kling Official, fal.ai, Seedance via Volcengine Ark, Runway, Veo, Gemini Omni, Higgsfield, MiniMax, HeyGen, Tencent Hunyuan, OpenRouter, ComfyUI Partner Nodes | WAN, Hunyuan, CogVideo, LTX, ComfyUI WAN, ComfyUI MiniMax H3 | Pexels, Pixabay (stock) |
+| **Text-to-Speech** | Azure AI Speech, ElevenLabs, fish.audio, Google TTS, Kling Official, OpenAI, OpenRouter | Piper | Piper, Google free tier, ElevenLabs free tier, Azure free tier, fish.audio s2.1-pro-free |
+| **Music Generation** | ElevenLabs, Suno, Google Lyria, OpenRouter (Lyria 3) | — | ElevenLabs free tier |
 | **Post-Production** | — | FFmpeg (compose, stitch, trim, mix, enhance, grade) | All free |
 | **Analysis** | — | WhisperX, Scene Detect, Frame Sampler, CLIP/BLIP-2 | All free |
 | **Enhancement** | — | Upscale, BG Remove, Face Enhance, Face Restore | All free |
