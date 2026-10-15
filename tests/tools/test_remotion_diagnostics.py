@@ -25,6 +25,43 @@ def tool(monkeypatch):
     return VideoCompose()
 
 
+def test_render_watchdog_scales_with_composition_length_not_cut_count():
+    """A long composition must not inherit the 600 s floor.
+
+    Live trap: an 11-cut, 67 s 1080p composition was killed at 600 s by the old
+    `max(600, scene_count * 15)` watchdog while it legitimately needed ~60 min on two
+    cores, and the error blamed a slow headless browser. Render time follows duration.
+    """
+    from tools.video.video_compose import _render_watchdog_seconds
+
+    short = {"cuts": [{"out_seconds": 3.0}, {"out_seconds": 6.0}]}
+    long = {"cuts": [{"out_seconds": 6.0 * index} for index in range(1, 12)]}
+
+    # a 6 s composition: 6 s × 60 + 600 s setup slack, never below the old floor
+    assert _render_watchdog_seconds(short) == 960
+    assert _render_watchdog_seconds(long) >= 600 + int(66.0 * 60)
+    # scenes (scene_plan shape) count the same way
+    assert _render_watchdog_seconds({"scenes": [{"duration_seconds": 40.0}]}) >= 2400
+
+
+def test_long_composition_gets_a_duration_scaled_watchdog(tool, tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_run_command(cmd, *a, **k):
+        seen["cmd"] = cmd
+        seen["timeout"] = k.get("timeout")
+        return None  # output absent on purpose; only the watchdog matters here
+
+    monkeypatch.setattr(tool, "run_command", fake_run_command)
+    cuts = [{"out_seconds": index * 6.0} for index in range(1, 12)]  # 66 s composition
+    tool._remotion_render(
+        {"composition_data": {"cuts": cuts}, "output_path": str(tmp_path / "out.mp4")}
+    )
+
+    # 66 s of 1080p at ~1x wall clock needs ~4000 s; the old floor allowed 600.
+    assert seen["timeout"] >= 4560
+
+
 def test_render_failure_surfaces_remotion_stderr_tail(tool, tmp_path, monkeypatch):
     stderr = "some npm noise\nError: Delayed render timed out\nRemotion actual cause here"
 

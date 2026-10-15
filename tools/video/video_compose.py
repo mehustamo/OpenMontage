@@ -55,6 +55,36 @@ from tools.base_tool import (
 )
 
 
+def _render_watchdog_seconds(props: dict, override_ms: "int | str | None" = None) -> int:
+    """Wall-clock horizon for the Remotion subprocess.
+
+    Render time scales with the composition's **duration and resolution**, not with how
+    many cuts it has. The old `max(600, scene_count * 15)` floor handed a 67 s 1080p
+    render (11 cuts) a 600 s watchdog and killed work that legitimately needed ~60 min
+    on two cores — with an error that blames a slow headless browser. Budget ~60 s of
+    wall clock per finished second (measured at 1080p on two cores) plus setup slack.
+    An explicit ``remotion_timeout_ms`` always wins over the estimate.
+    """
+    items = props.get("scenes") or props.get("cuts") or []
+    span = 0.0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key in ("out_seconds", "duration_seconds", "duration"):
+            try:
+                value = float(item.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+            span = max(span, value)
+    horizon = max(600, len(items) * 15, int(span * 60) + 600)
+    try:
+        if override_ms:
+            horizon = max(horizon, int(override_ms) // 1000 + 60)
+    except (TypeError, ValueError):
+        pass
+    return horizon
+
+
 class VideoCompose(BaseTool):
     name = "video_compose"
     version = "0.1.0"
@@ -2075,15 +2105,13 @@ class VideoCompose(BaseTool):
             # governs headless-browser setup and delayRender(); on slow machines or
             # restricted networks the default 30s browser setup times out with an
             # opaque failure. Pass it through and give the subprocess enough headroom
-            # so run_command() does not kill Remotion before its own timeout fires.
+            # (scaled to the composition's length, see _render_watchdog_seconds)
+            # so run_command() does not kill Remotion before it finishes.
             remotion_timeout_ms = inputs.get("remotion_timeout_ms")
-            scene_count = len(props.get("scenes") or props.get("cuts") or [])
-            subprocess_timeout = max(600, scene_count * 15)
+            subprocess_timeout = _render_watchdog_seconds(props, remotion_timeout_ms)
             if remotion_timeout_ms:
                 try:
-                    ms = int(remotion_timeout_ms)
-                    cmd.append(f"--timeout={ms}")
-                    subprocess_timeout = max(subprocess_timeout, ms // 1000 + 60)
+                    cmd.append(f"--timeout={int(remotion_timeout_ms)}")
                 except (TypeError, ValueError):
                     pass
 
