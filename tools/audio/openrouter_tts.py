@@ -234,6 +234,18 @@ class OpenRouterTTS(BaseTool):
         model = inputs.get("model_id") or inputs.get("model") or DEFAULT_TTS_MODEL
         voice = inputs.get("voice") or inputs.get("voice_id")
         known = SPEECH_MODELS.get(model)
+        formats = tuple(known.get("formats") or ()) if known else ()
+        requested = str(inputs.get("response_format") or "").lower()
+        if not requested:
+            # A host with a single accepted format decides the default (Gemini TTS
+            # is pcm-only); otherwise the delivery-ready mp3.
+            requested = formats[0] if formats else "mp3"
+        if formats and requested not in formats:
+            # Fail before spending the call: the host would answer 400 anyway
+            # (Gemini TTS, for example, accepts pcm only).
+            raise ValueError(
+                f"{model} accepts response_format {list(formats)}, not {requested!r}"
+            )
         if known and known.get("requires_voice") and not voice:
             # Some hosts reject a voiceless request. Fall back to the catalog's
             # sample voice so a selector call without an explicit voice still
@@ -249,7 +261,7 @@ class OpenRouterTTS(BaseTool):
             payload["voice"] = voice
         # Always send the format: the endpoint defaults to raw PCM when this is
         # omitted, which cannot be written into a .mp3 file.
-        payload["response_format"] = str(inputs.get("response_format") or "mp3").lower()
+        payload["response_format"] = requested
         for field in ("speed", "instructions"):
             if inputs.get(field) is not None:
                 payload[field] = inputs[field]

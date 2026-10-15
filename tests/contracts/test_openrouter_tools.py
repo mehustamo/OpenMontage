@@ -355,12 +355,17 @@ class TestSpeech:
         model, payload = OpenRouterTTS().build_request({
             "text": "hello",
             "voice": "en_paul_neutral",
-            "response_format": "wav",
+            "response_format": "pcm",
         })
         assert model == DEFAULT_TTS_MODEL
         assert payload["input"] == "hello"
         assert payload["voice"] == "en_paul_neutral"
-        assert payload["response_format"] == "wav"
+        assert payload["response_format"] == "pcm"
+
+    def test_a_host_rejects_a_format_it_does_not_accept(self):
+        # Voxtral takes mp3|pcm; wav is the one that used to slip through and 400.
+        with pytest.raises(ValueError):
+            OpenRouterTTS().build_request({"text": "hello", "response_format": "wav"})
 
     def test_response_format_is_always_sent(self):
         # Omitting it makes the endpoint stream raw PCM, which cannot be written
@@ -382,6 +387,24 @@ class TestSpeech:
         from tools.audio.openrouter_tts import format_from_content_type
 
         assert format_from_content_type(content_type) == expected
+
+    def test_gemini_tts_defaults_to_its_only_accepted_format(self):
+        # Gemini TTS rejects mp3 with a 400; the catalog decides the default instead.
+        model, payload = OpenRouterTTS().build_request({
+            "text": "hei",
+            "model_id": "google/gemini-3.8-flash-tts",
+        })
+        assert model == "google/gemini-3.8-flash-tts"
+        assert payload["response_format"] == "pcm"
+
+    def test_unsupported_format_for_a_host_fails_before_spending(self):
+        with pytest.raises(ValueError) as error:
+            OpenRouterTTS().build_request({
+                "text": "hei",
+                "model_id": "google/gemini-3.8-flash-tts",
+                "response_format": "mp3",
+            })
+        assert "pcm" in str(error.value)
 
     def test_response_format_only_offers_verified_values(self):
         # Voxtral rejects wav/flac/opus/aac with a 400; mp3 and pcm are what works.
@@ -447,6 +470,14 @@ class TestMusic:
     def test_price_is_reported_as_unquoted(self):
         with pytest.raises(PriceQuoteRequired):
             OpenRouterMusic().estimate_cost({"prompt": "x"})
+
+    def test_duration_is_reported_as_a_prompt_target_not_a_guarantee(self):
+        schema = OpenRouterMusic().input_schema["properties"]
+        assert "duration_seconds" in schema
+        # The delivered length is reported back; a 75 s request returned ~31 s live.
+        from tools.audio.openrouter_music import audio_duration_seconds
+
+        assert audio_duration_seconds("/definitely/not/a/file.mp3") == 0.0
 
 
 # ------------------------------------------------------------------
