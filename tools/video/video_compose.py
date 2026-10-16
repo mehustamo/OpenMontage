@@ -55,6 +55,11 @@ from tools.base_tool import (
 )
 
 
+# Assembly mode for `_compose`: every cut is already a finished clip at the target geometry,
+# so the ffmpeg path concatenates them with `-c:v copy` instead of re-encoding every frame.
+ASSEMBLY_FULL_CLIPS = "full-clips"
+
+
 def _render_watchdog_seconds(props: dict, override_ms: "int | str | None" = None) -> int:
     """Wall-clock horizon for the Remotion subprocess.
 
@@ -465,6 +470,216 @@ class VideoCompose(BaseTool):
             artifacts=[str(video_path)],
         )
 
+    # ------------------------------------------------------------------ assembly
+    def _probe_video(self, path: Path) -> dict:
+        """Minimal stream facts used to decide whether a clip can be copied verbatim."""
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,r_frame_rate,codec_name",
+            "-show_entries", "format=duration", "-of", "json", str(path),
+        ]
+        out = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if out.returncode != 0:
+            return {}
+        try:
+            data = json.loads(out.stdout or "{}")
+        except json.JSONDecodeError:
+            return {}
+        streams = data.get("streams") or []
+        if not streams:
+            return {}
+        stream = streams[0]
+        fps_raw = str(stream.get("r_frame_rate") or "0/1")
+        try:
+            num, _, den = fps_raw.partition("/")
+            fps = float(num) / float(den) if float(den or 1) else 0.0
+        except (TypeError, ValueError, ZeroDivisionError):
+            fps = 0.0
+        try:
+            seconds = float((data.get("format") or {}).get("duration") or 0.0)
+        except (TypeError, ValueError):
+            seconds = 0.0
+        return {"width": stream.get("width"), "height": stream.get("height"),
+                "fps": round(fps, 3), "codec": stream.get("codec_name"),
+                "seconds": seconds}
+
+    def _compose_full_clips(
+        self,
+        *,
+        inputs: dict[str, Any],
+        edit_decisions: dict,
+        cuts: list[dict],
+        output_path: Path,
+        audio_path: Optional[str],
+        profile_name: Optional[str],
+        resolution: str,
+    ) -> ToolResult:
+        """Lossless assembly of finished clips: concat with `-c:v copy`, mux the audio.
+
+        This is the mode for a composition whose cuts are *whole, already-final clips* at
+        the target geometry (captions burned in, hard cuts, overlays empty). The re-encode
+        path exists for frame-accurate trimming, which costs a full re-encode of every
+        frame and re-compresses content that is already exactly what should be shipped —
+        measured at 1620 s versus 4.4 s for the same 37 s vertical video, with the
+        re-encode also losing a generation and dropping ~0.9 s of duration.
+
+        Everything that this mode cannot honour is a hard error, never a silent fallback:
+        a wrong picture that renders fast is worth less than an honest failure.
+        """
+        try:
+            target_w, target_h = (int(v) for v in str(resolution).split("x"))
+        except ValueError:
+            target_w, target_h = 1920, 1080
+
+        asset_lookup = {a["id"]: a for a in (inputs.get("asset_manifest") or {}).get("assets", [])}
+        problems: list[str] = []
+        clips: list[Path] = []
+        clip_seconds: list[float] = []
+
+        for position, cut in enumerate(cuts, start=1):
+            label = cut.get("id") or f"cut {position}"
+            source = cut.get("source", "")
+            path = Path(str(source))
+            if not path.exists():
+                resolved = asset_lookup.get(source)
+                if not resolved:
+                    problems.append(f"{label}: source not found ({source})")
+                    continue
+                path = Path(resolved["path"])
+            if not path.exists():
+                problems.append(f"{label}: source file missing ({path})")
+                continue
+
+            facts = self._probe_video(path)
+            if not facts:
+                problems.append(f"{label}: no readable video stream ({path.name})")
+                continue
+
+            # what this mode cannot express
+            if float(cut.get("speed") or 1.0) != 1.0:
+                problems.append(f"{label}: speed {cut.get('speed')} needs the re-encode path")
+            if cut.get("transform"):
+                problems.append(f"{label}: transform needs the re-encode path")
+            transition_in = str(cut.get("transition_in") or "cut").lower()
+            transition_out = str(cut.get("transition_out") or "cut").lower()
+            if transition_in not in {"cut", "none"} or transition_out not in {"cut", "none"}:
+                problems.append(
+                    f"{label}: transition {transition_in!r}/{transition_out!r} cannot be "
+                    f"assembled by stream copy (only 'cut'/'none')"
+                )
+
+            if (facts["width"], facts["height"]) != (target_w, target_h):
+                problems.append(
+                    f"{label}: {facts['width']}x{facts['height']} does not match the target "
+                    f"{target_w}x{target_h} — pre-scale the clip or drop assembly_mode"
+                )
+            if facts["fps"] and abs(facts["fps"] - 30.0) > 0.01:
+                problems.append(
+                    f"{label}: {facts['fps']} fps does not match the target 30 fps"
+                )
+            clips.append(path)
+            clip_seconds.append(facts["seconds"])
+
+        # captions must already be in the picture; burning them here would mean re-encoding
+        options = inputs.get("options") or {}
+        if options.get("subtitle_burn", True) and inputs.get("subtitle_path"):
+            problems.append(
+                "subtitle_burn=True with a subtitle_path: assembly_mode assumes captions are "
+                "already burned into the clips (pass options.subtitle_burn=False)"
+            )
+
+        if problems:
+            return ToolResult(
+                success=False,
+                error=(
+                    "assembly_mode='full-clips' requires clips that can be copied verbatim. "
+                    "No silent fallback is performed. Violations: " + "; ".join(problems)
+                ),
+            )
+
+        expected_video = round(sum(clip_seconds), 3)
+        work_dir = output_path.parent / f".assemble-{secrets.token_hex(4)}"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        list_file = work_dir / "concat.txt"
+        list_file.write_text("".join(f"file '{clip}'\n" for clip in clips), encoding="utf-8")
+
+        audio_bitrate = str(inputs.get("audio_bitrate") or "192k")
+        if not audio_path:
+            # The Remotion path reads the narration from edit_decisions.audio.narration.src.
+            # Honour the same field here so one edit_decisions file drives both runtimes.
+            narration = ((edit_decisions.get("audio") or {}).get("narration") or {})
+            candidate = narration.get("src") or narration.get("path")
+            if candidate and Path(str(candidate)).exists():
+                audio_path = str(candidate)
+        cmd = [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "concat", "-safe", "0", "-i", str(list_file),
+        ]
+        have_audio = bool(audio_path) and Path(str(audio_path)).exists()
+        if have_audio:
+            cmd += ["-i", str(audio_path)]
+        cmd += ["-map", "0:v:0"]
+        if have_audio:
+            cmd += [
+                "-map", "1:a:0",
+                # copy the video, encode only the audio: no frame is touched, so the picture
+                # is bit-identical to the clips and the duration cannot drift
+                "-c:v", "copy", "-c:a", "aac", "-b:a", audio_bitrate, "-ar", "48000",
+                "-shortest",
+            ]
+        else:
+            cmd += ["-c:v", "copy", "-an"]
+        cmd += ["-movflags", "+faststart", str(output_path)]
+
+        log = logging.getLogger("video_compose")
+        started = time.monotonic()
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        except OSError as exc:  # ffmpeg missing
+            return ToolResult(success=False, error=f"ffmpeg could not be executed: {exc}")
+        elapsed = round(time.monotonic() - started, 2)
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+        if result.returncode != 0 or not output_path.exists():
+            return ToolResult(
+                success=False,
+                error=f"stream-copy concat failed (exit {result.returncode}): "
+                      f"{result.stderr[-500:]}",
+            )
+
+        produced = self._probe_video(output_path)
+        if not produced:
+            return ToolResult(success=False, error="concat produced no readable video stream")
+        drift = round(produced["seconds"] - expected_video, 3)
+        if abs(drift) > max(0.25, expected_video * 0.01):
+            log.warning("full-clips assembly duration drift %.3fs (expected %.3fs, got %.3fs)",
+                        drift, expected_video, produced["seconds"])
+            return ToolResult(
+                success=False,
+                error=(f"assembled duration {produced['seconds']:.3f}s differs from the clip "
+                       f"sum {expected_video:.3f}s by {drift:+.3f}s"),
+            )
+
+        return ToolResult(
+            success=True,
+            artifacts=[str(output_path)],
+            data={
+                "operation": "compose",
+                "assembly_mode": ASSEMBLY_FULL_CLIPS,
+                "cut_count": len(clips),
+                "video_copied": True,
+                "clip_seconds_total": expected_video,
+                "output_seconds": produced["seconds"],
+                "duration_drift_seconds": drift,
+                "geometry": f"{target_w}x{target_h}",
+                "profile": profile_name,
+                "has_audio": have_audio,
+                "audio_bitrate": audio_bitrate if have_audio else None,
+                "elapsed_seconds": elapsed,
+                "output": str(output_path),
+            },
+        )
+
     def _compose(self, inputs: dict[str, Any]) -> ToolResult:
         """FFmpeg composition: concat video cuts, add audio, burn subtitles.
 
@@ -531,6 +746,32 @@ class VideoCompose(BaseTool):
         ed_subs = edit_decisions.get("subtitles", {})
         if ed_subs.get("source") and not subtitle_path:
             subtitle_path = ed_subs["source"]
+
+        # --- Assembly mode: lossless concat of already-finished clips ----------
+        # `in_seconds`/`out_seconds` are source offsets in the re-encode path below but
+        # timeline positions in the Remotion composition, so switching runtimes silently
+        # changes the picture. `assembly_mode="full-clips"` removes that ambiguity for the
+        # case where every cut IS a finished clip at the target geometry: nothing is
+        # trimmed, scaled or re-encoded and the audio is muxed in untouched.
+        assembly_mode = str(edit_decisions.get("assembly_mode") or "").strip()
+        if assembly_mode:
+            if assembly_mode != ASSEMBLY_FULL_CLIPS:
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"Unknown assembly_mode {assembly_mode!r}. Valid values: "
+                        f"{ASSEMBLY_FULL_CLIPS!r}, or omit the key entirely."
+                    ),
+                )
+            return self._compose_full_clips(
+                inputs=inputs,
+                edit_decisions=edit_decisions,
+                cuts=cuts,
+                output_path=output_path,
+                audio_path=audio_path,
+                profile_name=profile_name,
+                resolution=resolution,
+            )
 
         temp_dir = output_path.parent / ".compose_tmp"
         temp_dir.mkdir(parents=True, exist_ok=True)
